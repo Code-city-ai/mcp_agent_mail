@@ -102,6 +102,13 @@ except Exception:  # pragma: no cover - optional dependency fallback
 logger = logging.getLogger(__name__)
 _BACKGROUND_ARCHIVE_TASKS: set[asyncio.Task[None]] = set()
 _MAX_BACKGROUND_ARCHIVE_RECIPIENTS = 20
+_ENABLE_GIT_ARCHIVE_WRITES_ENV = "AGENT_MAIL_ENABLE_GIT_ARCHIVE_WRITES"
+
+
+def _git_archive_writes_enabled() -> bool:
+    """Keep Agent Mail coordination DB-first; Git archiving is opt-in."""
+
+    return os.getenv(_ENABLE_GIT_ARCHIVE_WRITES_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class _FastMCPToolGetter(Protocol):
@@ -3525,27 +3532,28 @@ async def _get_or_create_agent(
         else:
             await _touch_window_identity(window_identity, ttl_days)
 
-    archive = await ensure_archive(settings, project.slug)
-    agent_dict = _agent_to_dict(agent)
-    if window_identity is not None:
-        agent_dict["window_id"] = window_identity.window_uuid
-        agent_dict["window_display_name"] = window_identity.display_name
-    try:
-        async with _archive_write_lock(archive):
-            await write_agent_profile(archive, agent_dict)
-    except Exception:
-        # Roll back the DB record if the archive write fails and we just
-        # created the agent.  This keeps the two stores consistent so the
-        # caller doesn't receive an error while the agent already exists in
-        # the DB (issue #121).
-        if newly_created:
-            with suppress(Exception):
-                async with get_session() as rollback_session:
-                    db_agent = await rollback_session.get(Agent, agent.id)
-                    if db_agent:
-                        await rollback_session.delete(db_agent)
-                        await rollback_session.commit()
-        raise
+    if _git_archive_writes_enabled():
+        archive = await ensure_archive(settings, project.slug)
+        agent_dict = _agent_to_dict(agent)
+        if window_identity is not None:
+            agent_dict["window_id"] = window_identity.window_uuid
+            agent_dict["window_display_name"] = window_identity.display_name
+        try:
+            async with _archive_write_lock(archive):
+                await write_agent_profile(archive, agent_dict)
+        except Exception:
+            # Roll back the DB record if the archive write fails and we just
+            # created the agent.  This keeps the two stores consistent so the
+            # caller doesn't receive an error while the agent already exists in
+            # the DB (issue #121).
+            if newly_created:
+                with suppress(Exception):
+                    async with get_session() as rollback_session:
+                        db_agent = await rollback_session.get(Agent, agent.id)
+                        if db_agent:
+                            await rollback_session.delete(db_agent)
+                            await rollback_session.commit()
+            raise
     return agent
 
 
@@ -5479,19 +5487,12 @@ def build_mcp_server() -> FastMCP:
                 topic=topic,
                 reply_to=reply_to,
             )
-            frontmatter = _message_frontmatter(
-                message,
-                project,
-                sender,
-                sender_project,
-                to_agents,
-                cc_agents,
-                bcc_agents,
-                attachments_meta,
-            )
             recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
             payload = _message_to_dict(message)
             archive_status = (
+                "db_only_archive_disabled"
+                if not _git_archive_writes_enabled()
+                else
                 "skipped_large_fanout"
                 if len(recipients_for_archive) > _MAX_BACKGROUND_ARCHIVE_RECIPIENTS
                 else "queued"
@@ -5518,6 +5519,17 @@ def build_mcp_server() -> FastMCP:
                 payload["window_display_name"] = window_identity.display_name
 
             if archive_status == "queued":
+                frontmatter = _message_frontmatter(
+                    message,
+                    project,
+                    sender,
+                    sender_project,
+                    to_agents,
+                    cc_agents,
+                    bcc_agents,
+                    attachments_meta,
+                )
+
                 async def _deferred_archive_write() -> None:
                     async with _archive_write_lock(archive, timeout_seconds=2.0):
                         await write_message_bundle(
@@ -6888,20 +6900,21 @@ def build_mcp_server() -> FastMCP:
                 await session.refresh(db_agent)
                 agent = db_agent
         agent, token = await _ensure_agent_registration_token(agent)
-        archive = await ensure_archive(settings, project.slug)
-        try:
-            async with _archive_write_lock(archive):
-                await write_agent_profile(archive, _agent_to_dict(agent))
-        except Exception:
-            # Roll back the DB record so the caller doesn't get an error
-            # while the agent already exists in the database (issue #121).
-            with suppress(Exception):
-                async with get_session() as rollback_session:
-                    db_agent = await rollback_session.get(Agent, agent.id)
-                    if db_agent:
-                        await rollback_session.delete(db_agent)
-                        await rollback_session.commit()
-            raise
+        if _git_archive_writes_enabled():
+            archive = await ensure_archive(settings, project.slug)
+            try:
+                async with _archive_write_lock(archive):
+                    await write_agent_profile(archive, _agent_to_dict(agent))
+            except Exception:
+                # Roll back the DB record so the caller doesn't get an error
+                # while the agent already exists in the database (issue #121).
+                with suppress(Exception):
+                    async with get_session() as rollback_session:
+                        db_agent = await rollback_session.get(Agent, agent.id)
+                        if db_agent:
+                            await rollback_session.delete(db_agent)
+                            await rollback_session.commit()
+                raise
         _bind_session_agent(ctx, project, agent)
         await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
         result = _agent_to_dict(agent)
