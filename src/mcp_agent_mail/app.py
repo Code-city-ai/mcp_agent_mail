@@ -111,6 +111,15 @@ def _git_archive_writes_enabled() -> bool:
     return os.getenv(_ENABLE_GIT_ARCHIVE_WRITES_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+@asynccontextmanager
+async def _maybe_archive_write_lock(archive: ProjectArchive | None) -> AsyncIterator[None]:
+    if archive is None:
+        yield
+        return
+    async with _archive_write_lock(archive):
+        yield
+
+
 class _FastMCPToolGetter(Protocol):
     async def get_tool(self, name: str) -> Any: ...
 
@@ -3959,6 +3968,8 @@ async def _write_file_reservation_records(
 ) -> None:
     if not records:
         return
+    if not _git_archive_writes_enabled():
+        return
     if archive_locked and archive is None:
         raise ValueError("archive_locked=True requires a provided archive")
     settings = get_settings()
@@ -5440,7 +5451,7 @@ def build_mcp_server() -> FastMCP:
         recipient_records.extend((agent, "cc") for agent in cc_agents)
         recipient_records.extend((agent, "bcc") for agent in bcc_agents)
 
-        archive = await ensure_archive(settings, project.slug)
+        archive = await ensure_archive(settings, project.slug) if _git_archive_writes_enabled() else None
         sender_project = project if sender.project_id == project.id else await _get_project_by_id(sender.project_id)
         sender_is_local = sender_project.id == project.id
         sender_archive_label = _sender_display_name(
@@ -5577,7 +5588,17 @@ def build_mcp_server() -> FastMCP:
             )
             return payload
 
-        async with _archive_write_lock(archive):
+        if archive is None:
+            raise ToolExecutionError(
+                "ARCHIVE_DISABLED",
+                "Messages that require attachment/image archiving are disabled while "
+                f"{_ENABLE_GIT_ARCHIVE_WRITES_ENV} is unset. Send plain-text Agent Mail "
+                "or enable Git archive writes explicitly.",
+                recoverable=True,
+                data={"archive_status": "db_only_archive_disabled"},
+            )
+
+        async with _maybe_archive_write_lock(archive):
             # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists
             if settings.file_reservations_enforcement_enabled:
                 await _expire_stale_file_reservations(
@@ -11403,7 +11424,7 @@ def build_mcp_server() -> FastMCP:
 
         granted: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
-        archive = await ensure_archive(settings, project.slug)
+        archive = await ensure_archive(settings, project.slug) if _git_archive_writes_enabled() else None
         ctx_branch: Optional[str] = None
         ctx_worktree: Optional[str] = None
         try:
@@ -11421,7 +11442,7 @@ def build_mcp_server() -> FastMCP:
                     ctx_worktree = None
         except Exception:
             pass
-        async with _archive_write_lock(archive):
+        async with _maybe_archive_write_lock(archive):
             # Use BEGIN IMMEDIATE to acquire a fresh WAL snapshot, preventing
             # stale reads that cause duplicate exclusive holders (#129) and
             # phantom conflicts after release (#130).  The entire read-check-
@@ -11548,7 +11569,7 @@ def build_mcp_server() -> FastMCP:
                     existing_reservations.append((file_reservation, agent.name))
                 # Commit all reservations atomically within the IMMEDIATE tx
                 await session.commit()
-            if payloads:
+            if payloads and archive is not None:
                 try:
                     await write_file_reservation_records(archive, payloads)
                 except Exception:
