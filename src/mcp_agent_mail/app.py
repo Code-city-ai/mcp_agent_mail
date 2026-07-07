@@ -100,6 +100,8 @@ except Exception:  # pragma: no cover - optional dependency fallback
     PathSpec = None
 
 logger = logging.getLogger(__name__)
+_BACKGROUND_ARCHIVE_TASKS: set[asyncio.Task[None]] = set()
+_MAX_BACKGROUND_ARCHIVE_RECIPIENTS = 20
 
 
 class _FastMCPToolGetter(Protocol):
@@ -1905,6 +1907,34 @@ def _apply_sender_identity(
             sender_project_slug,
             sender_name,
         )
+
+
+def _track_background_archive_task(
+    task: asyncio.Task[None],
+    *,
+    project_slug: str,
+    message_id: int | None,
+) -> None:
+    """Keep deferred archive writes observable without blocking message delivery."""
+
+    _BACKGROUND_ARCHIVE_TASKS.add(task)
+
+    def _done(done_task: asyncio.Task[None]) -> None:
+        _BACKGROUND_ARCHIVE_TASKS.discard(done_task)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            logger.warning(
+                "archive.background_write_cancelled",
+                extra={"project_slug": project_slug, "message_id": message_id},
+            )
+        except Exception:
+            logger.exception(
+                "archive.background_write_failed",
+                extra={"project_slug": project_slug, "message_id": message_id},
+            )
+
+    task.add_done_callback(_done)
 
 
 def _message_frontmatter(
@@ -5428,6 +5458,112 @@ def build_mcp_server() -> FastMCP:
         _wi_uuid = getattr(settings, "window_identity_uuid", "") or ""
         if _wi_uuid and _validate_window_uuid(_wi_uuid):
             window_identity = await _get_window_identity(project, _wi_uuid)
+
+        has_archive_attachments = bool(attachment_paths) or (
+            convert_markdown and ("![" in body_md or "data:image" in body_md)
+        )
+        if not has_archive_attachments:
+            processed_body = body_md
+            attachments_meta: list[dict[str, Any]] = []
+            attachment_files: list[str] = []
+            message = await _create_message(
+                project,
+                sender,
+                subject,
+                processed_body,
+                recipient_records,
+                importance,
+                ack_required,
+                thread_id,
+                attachments_meta,
+                topic=topic,
+                reply_to=reply_to,
+            )
+            frontmatter = _message_frontmatter(
+                message,
+                project,
+                sender,
+                sender_project,
+                to_agents,
+                cc_agents,
+                bcc_agents,
+                attachments_meta,
+            )
+            recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
+            payload = _message_to_dict(message)
+            archive_status = (
+                "skipped_large_fanout"
+                if len(recipients_for_archive) > _MAX_BACKGROUND_ARCHIVE_RECIPIENTS
+                else "queued"
+            )
+            payload.update(
+                {
+                    "to": [agent.name for agent in to_agents],
+                    "cc": [agent.name for agent in cc_agents],
+                    "bcc": [agent.name for agent in bcc_agents],
+                    "attachments": attachments_meta,
+                    "archive_status": archive_status,
+                }
+            )
+            _apply_sender_identity(
+                payload,
+                message_project_id=message.project_id,
+                sender_name=sender.name,
+                sender_project_id=sender_project.id,
+                sender_project_human_key=sender_project.human_key,
+                sender_project_slug=sender_project.slug,
+            )
+            if window_identity is not None:
+                payload["window_id"] = window_identity.window_uuid
+                payload["window_display_name"] = window_identity.display_name
+
+            if archive_status == "queued":
+                async def _deferred_archive_write() -> None:
+                    async with _archive_write_lock(archive, timeout_seconds=2.0):
+                        await write_message_bundle(
+                            archive,
+                            frontmatter,
+                            processed_body,
+                            sender_archive_label,
+                            recipients_for_archive,
+                            attachment_files,
+                            sender_outbox_name=sender.name if sender_is_local else None,
+                        )
+
+                archive_task = asyncio.create_task(_deferred_archive_write())
+                _track_background_archive_task(
+                    archive_task,
+                    project_slug=project.slug,
+                    message_id=message.id,
+                )
+
+            if settings.notifications.enabled:
+                notification_message_meta = {
+                    "id": message.id,
+                    "from": sender.name,
+                    "subject": subject,
+                    "importance": importance,
+                }
+                if not sender_is_local:
+                    notification_message_meta["from_project"] = sender_project.human_key
+                notification_targets = [agent.name for agent in to_agents + cc_agents]
+                for target_name in notification_targets:
+                    with suppress(Exception):
+                        await emit_notification_signal(
+                            settings,
+                            project.slug,
+                            target_name,
+                            notification_message_meta,
+                        )
+
+            preview_names = ", ".join(recipients_for_archive[:10])
+            if len(recipients_for_archive) > 10:
+                preview_names = f"{preview_names}, +{len(recipients_for_archive) - 10} more"
+            await ctx.info(
+                f"Message {message.id} created by {sender.name} "
+                f"(to {preview_names}; archive_status={archive_status})"
+            )
+            return payload
 
         async with _archive_write_lock(archive):
             # Server-side file_reservations enforcement: block if conflicting active exclusive file_reservation exists

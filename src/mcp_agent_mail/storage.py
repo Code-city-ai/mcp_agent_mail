@@ -1278,7 +1278,44 @@ def _path_exists(path: Path) -> bool:
 
 
 def _list_rglob_paths(root: Path, pattern: str) -> list[Path]:
-    return list(root.rglob(pattern))
+    """Return matching paths while pruning archive payload directories.
+
+    Lock healing/status only needs lock artifacts, not every copied inbox,
+    message, attachment, or git object. On large fleet mailboxes, an
+    unrestricted Path.rglob("*.lock") over the storage root can delay HTTP
+    startup long enough that launchd repeatedly kills the service before it
+    binds the port.
+    """
+
+    skip_dirs = {
+        ".git",
+        "agents",
+        "messages",
+        "attachments",
+        "thread_digests",
+        "artifacts",
+        "backups",
+        "__pycache__",
+    }
+    matches: list[Path] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    name = entry.name
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if name not in skip_dirs:
+                                stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False) and Path(name).match(pattern):
+                            matches.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return matches
 
 
 def _restore_bundle_into_archive(bundle_to_restore: Path, target_root: Path) -> None:
